@@ -1,0 +1,211 @@
+#include "BluetoothSerial.h"
+#include <ESP32Servo.h>
+#include "DHT.h"
+#include <NewPing.h>
+
+//DECLARACION PID
+int deseo=15;
+float duracion, pid, salida, distancia, h, tk,tk_1,error=0,error_anterior=0,derivativo,integral,kp=20,ki=0.002,kd=1;
+
+//DECLARACION DE PINES PARA EL MOTORSHIELD
+char pinData=18;//Cambielo por un pin de la ESP32,debe ir conectado al 8 del motorshield
+char pinLatch=5;//Cambielo por un pin de la ESP32,debe ir conectado al 12 del motorshield
+char pinClock=19 ;//Cambielo por un pin de la ESP32,debe ir conectado al 4 del motorshield
+
+//DHT 11
+#define DHTPIN 23
+#define DHTTYPE DHT11   // DHT 11
+DHT dht(DHTPIN, DHTTYPE);
+
+//Mejoras en el PWM
+int freq = 5000;
+char resolution = 8;
+
+//PWM anteriores
+char EN1Y2I=32;
+char EN3Y4I=21;
+char EN1Y2D=4;
+char EN3Y4D=15;
+volatile uint8_t VP=255;
+char data = B00000000;
+short mode=0;
+
+volatile float d_frente=0;
+volatile float d_derecha=0;
+volatile float d_izquierda=0;
+
+
+//DECLARACION PARA MENSAJE BLUETOOTH
+int msg_recive;
+
+//DECLARACION PARA SERVOMOTOR
+//Servo SN;
+//#define Servopin 13
+
+//define sound speed in cm/uS
+#define SOUND_SPEED 0.034
+
+int trigPin = 13;
+int echoPin = 14;
+
+long duration;
+float distanceCm;
+
+//DEFINICION PARA EL BLUETOOTH
+String device_name = "ESP32-BT-TERRENEITOR";
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
+#endif
+
+#if !defined(CONFIG_BT_SPP_ENABLED)
+#error Serial Bluetooth not available or not enabled. It is only available for the ESP32 chip.
+#endif
+
+BluetoothSerial SerialBT;
+
+
+void setup(){
+
+  //SN.attach(Servopin);
+  //SN.write(0);
+
+  dht.begin();
+
+  Serial.begin(115200);
+  SerialBT.begin(device_name);
+  Serial.printf("The device with name \"%s\" is started.\nNow you can pair it with Bluetooth!\n", device_name.c_str());
+
+  pinMode(pinData, OUTPUT);
+  pinMode(pinLatch, OUTPUT);
+  pinMode(pinClock, OUTPUT);
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  pinMode(EN1Y2I, OUTPUT);
+  pinMode(EN3Y4I, OUTPUT);
+  pinMode(EN1Y2D, OUTPUT);
+  pinMode(EN3Y4D, OUTPUT);
+  
+}
+
+void loop(){
+  if(mode==0){
+
+    digitalWrite(EN1Y2D, HIGH);
+    digitalWrite(EN3Y4D, HIGH);
+    digitalWrite(EN1Y2I, HIGH);
+    digitalWrite(EN3Y4I, HIGH);
+
+    if(SerialBT.available()) {
+      //Serial.write(SerialBT.read());
+      msg_recive=SerialBT.read();
+      if(msg_recive=='A'){data=B10011001;}
+      if(msg_recive=='B'){data=B01100110;}
+      if(msg_recive=='C'){data=B00011110;}
+      if(msg_recive=='D'){data=B11100001;}
+      if(msg_recive=='Z'){data=B00000000;}
+      if(msg_recive=='X'){mode=1;}
+      }
+
+    motorWrite(data);
+    }
+
+  if(mode==1){
+
+    data=B00000000;
+    motorWrite(data);
+
+    distancia=sensar();
+
+    if(distancia==deseo){data=B11100001;motorWrite(data);delay(250);}
+
+    tk=millis();
+    h=tk+tk_1;
+    error=deseo-distancia;
+    integral=integral+error*h;
+    derivativo=(error-error_anterior)/h;
+    pid=error*kp+integral*ki+derivativo*kd;
+    error_anterior=error;
+    tk_1=tk;
+
+    if (pid<0){
+      salida=map(pid,-100,0,100,0);
+      data=B10011001;
+      motorWrite(data);
+      delay(10*salida);
+    }
+    else{
+      salida=map(pid,0,85,0,255);
+      data=B01100110;
+      motorWrite(data);
+      delay(10*salida);
+    }
+
+    if (SerialBT.available()){
+      //Serial.write(SerialBT.read());
+      msg_recive=SerialBT.read();
+      if(msg_recive=='X'){mode=0;}
+    }
+
+  }
+
+  delay(1);
+
+  //DHT11
+  float h = dht.readHumidity();
+  // Read temperature as Celsius (the default)
+  float t = dht.readTemperature();
+  // Read temperature as Fahrenheit (isFahrenheit = true)
+  float f = dht.readTemperature(true);
+
+  // Check if any reads failed and exit early (to try again).
+  if (isnan(h) || isnan(t) || isnan(f)) {
+    Serial.println(F("Failed to read from DHT sensor!"));
+    return;
+  }
+
+  // Compute heat index in Fahrenheit (the default)
+  float hif = dht.computeHeatIndex(f, h);
+  // Compute heat index in Celsius (isFahreheit = false)
+  float hic = dht.computeHeatIndex(t, h, false);
+
+  Serial.print(F("Humidity: "));
+  Serial.print(h);
+  Serial.print(F("% "));
+  Serial.print("   ");
+  Serial.print(F("Temperature: "));
+  Serial.print(t);
+  Serial.print(F("°C "));
+  Serial.println();
+
+}
+
+
+void motorWrite(int Led){
+  shiftOut(pinData, pinClock, LSBFIRST, Led);
+  digitalWrite(pinLatch, HIGH);
+  digitalWrite(pinLatch, LOW);
+}
+
+float sensar(){
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  // Sets the trigPin on HIGH state for 10 micro seconds
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  // Reads the echoPin, returns the sound wave travel time in microseconds
+  duration = pulseIn(echoPin, HIGH);
+  
+  // Calculate the distance
+  distanceCm = duration * SOUND_SPEED/2;
+  
+  // Prints the distance in the Serial Monitor
+  Serial.print("Distance (cm): ");
+  Serial.println(distanceCm);
+  delay(1000);
+  return distanceCm;
+}
